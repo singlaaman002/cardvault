@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>CardVault</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body,#root{height:100%;font-family:'Segoe UI',system-ui,sans-serif}
+body{background:#f4f5f7}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:3px}
+input,button,select{font-family:inherit}
+@keyframes zoomIn{from{opacity:0;transform:scale(0.88)}to{opacity:1;transform:scale(1)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes slideIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
+.spinner{width:13px;height:13px;border:2px solid #e5e7eb;border-top-color:#6366f1;border-radius:50%;animation:spin 0.7s linear infinite;display:inline-block;vertical-align:middle}
+.drawer{animation:slideIn 0.18s ease}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useRef,useCallback,useEffect}=React;
+
+// ── STORAGE ───────────────────────────────────────────────────────────────────
+const STORAGE_KEY="cardvault_v3";
+const SETTINGS_KEY="cardvault_settings";
+function loadCards(){try{const r=localStorage.getItem(STORAGE_KEY);return r?JSON.parse(r):[]}catch{return[]}}
+function saveCards(c){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(c))}catch(e){console.warn("Storage full",e)}}
+function loadSettings(){try{const r=localStorage.getItem(SETTINGS_KEY);return r?JSON.parse(r):{}}catch{return{}}}
+function saveSettings(s){try{localStorage.setItem(SETTINGS_KEY,JSON.stringify(s))}catch{}}
+
+// ── API CALLS (go to YOUR Vercel backend) ────────────────────────────────────
+// In production this is blank (same domain). In dev you can set a full URL.
+const API_BASE = window.location.hostname === 'localhost' ? 'http://localhost:3000' : '';
+
+async function apiCall(endpoint, body) {
+  const res = await fetch(`${API_BASE}/api/${endpoint}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `API error ${res.status}`);
+  }
+  return res.json();
+}
+
+// Analyze a batch of up to 5 cards at once
+async function analyzeBatch(images) {
+  return apiCall('analyze', { images: images.map(i => ({ base64: i.base64, mediaType: i.mediaType })) });
+}
+
+// Fetch live comps for a single card
+async function fetchComps(cardInfo) {
+  return apiCall('comps', { cardInfo });
+}
+
+// PSA cert lookup
+async function lookupPSA(certNumber, psaToken) {
+  return apiCall('psa', { certNumber, psaToken });
+}
+
+// Duplicate check
+async function checkDuplicate(base64, mediaType, existingCards) {
+  return apiCall('duplicate', { base64, mediaType, existingCards });
+}
+
+// ── IMAGE HELPER ──────────────────────────────────────────────────────────────
+function readImageFile(file){
+  return new Promise((resolve,reject)=>{
+    const reader=new FileReader();
+    reader.onload=e=>{
+      const dataUrl=e.target.result;
+      if(file.type==="image/jpeg"||file.type==="image/png"||file.type==="image/webp"){
+        resolve({dataUrl,base64:dataUrl.split(",")[1],mediaType:file.type});return;
+      }
+      const img=new Image();
+      img.onload=()=>{
+        try{
+          const c=document.createElement("canvas");
+          c.width=img.naturalWidth||800;c.height=img.naturalHeight||800;
+          c.getContext("2d").drawImage(img,0,0);
+          const jpeg=c.toDataURL("image/jpeg",0.88);
+          resolve(jpeg.length>100?{dataUrl:jpeg,base64:jpeg.split(",")[1],mediaType:"image/jpeg"}:{dataUrl,base64:dataUrl.split(",")[1],mediaType:file.type||"image/jpeg"});
+        }catch{resolve({dataUrl,base64:dataUrl.split(",")[1],mediaType:file.type||"image/jpeg"})}
+      };
+      img.onerror=()=>resolve({dataUrl,base64:dataUrl.split(",")[1],mediaType:file.type||"image/jpeg"});
+      img.src=dataUrl;
+    };
+    reader.onerror=()=>reject(new Error("Failed to read "+file.name));
+    reader.readAsDataURL(file);
+  });
+}
+
+// ── CONSTANTS ─────────────────────────────────────────────────────────────────
+const SPORTS=[
+  {key:"soccer",label:"Soccer",emoji:"⚽",accent:"#16a34a",light:"#f0fdf4",border:"#bbf7d0"},
+  {key:"basketball",label:"Basketball",emoji:"🏀",accent:"#ea580c",light:"#fff7ed",border:"#fed7aa"},
+  {key:"baseball",label:"Baseball",emoji:"⚾",accent:"#2563eb",light:"#eff6ff",border:"#bfdbfe"},
+];
+const fmt=n=>n!=null?"$"+Number(n).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2}):"—";
+const fmtK=n=>{if(!n)return"—";return n>=1000?"$"+(n/1000).toFixed(1)+"k":"$"+Math.round(n)};
+const pct=(cost,mkt)=>(!cost||!mkt||cost<=0)?null:((mkt-cost)/cost)*100;
+const absDiff=(cost,mkt)=>(!cost||!mkt||cost<=0)?null:mkt-cost;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+// ── COMPONENTS ────────────────────────────────────────────────────────────────
+function ReturnBadge({cost,mkt}){
+  const p=pct(cost,mkt),d=absDiff(cost,mkt);
+  if(p===null)return React.createElement("span",{style:{color:"#9ca3af",fontSize:12}},"—");
+  const up=p>=0,color=up?"#15803d":"#dc2626",bg=up?"#dcfce7":"#fee2e2";
+  return React.createElement("span",{style:{display:"inline-flex",flexDirection:"column",alignItems:"flex-end",gap:1}},
+    React.createElement("span",{style:{fontSize:12,fontWeight:700,padding:"2px 8px",borderRadius:20,background:bg,color,whiteSpace:"nowrap"}},(up?"▲":"▼")+" "+Math.abs(p).toFixed(1)+"%"),
+    d!=null&&React.createElement("span",{style:{fontSize:11,fontWeight:600,color,whiteSpace:"nowrap",paddingRight:2}},(up?"+":"−")+fmt(Math.abs(d)))
+  );
+}
+
+function SportChip({sport}){
+  const s=SPORTS.find(x=>x.key===sport);
+  if(!s)return React.createElement("span",{style:{fontSize:11,color:"#9ca3af"}},"—");
+  return React.createElement("span",{style:{fontSize:11,fontWeight:600,padding:"2px 8px",borderRadius:20,background:s.light,color:s.accent,border:`1px solid ${s.border}`,whiteSpace:"nowrap"}},s.emoji+" "+s.label);
+}
+
+function InlineEdit({value,onChange}){
+  const[editing,setEditing]=useState(false);
+  const[raw,setRaw]=useState(value!=null?String(value):"");
+  useEffect(()=>{setRaw(value!=null?String(value):"");},[value]);
+  const commit=()=>{const n=parseFloat(raw);onChange(isNaN(n)?null:n);setEditing(false)};
+  if(editing)return React.createElement("span",{style:{display:"inline-flex",alignItems:"center",gap:3}},
+    React.createElement("span",{style:{fontSize:12,color:"#6b7280"}},"$"),
+    React.createElement("input",{autoFocus:true,value:raw,onChange:e=>setRaw(e.target.value),onBlur:commit,onKeyDown:e=>e.key==="Enter"&&commit(),
+      style:{width:72,fontSize:13,padding:"2px 6px",border:"1px solid #6366f1",borderRadius:5,outline:"none",color:"#111827",background:"#fff",fontWeight:600}})
+  );
+  return React.createElement("span",{onClick:()=>{setRaw(value!=null?String(value):"");setEditing(true)},
+    style:{cursor:"pointer",fontSize:13,fontWeight:value!=null?600:400,color:value!=null?"#111827":"#9ca3af",borderBottom:"1px dashed #d1d5db",paddingBottom:1}},
+    value!=null?fmt(value):"+ Add cost");
+}
+
+function ImageZoom({src,onClose}){
+  if(!src)return null;
+  return React.createElement("div",{onClick:onClose,style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.88)",zIndex:400,display:"flex",alignItems:"center",justifyContent:"center",cursor:"zoom-out"}},
+    React.createElement("div",{onClick:e=>e.stopPropagation(),style:{position:"relative",maxWidth:"92vw",maxHeight:"92vh"}},
+      React.createElement("img",{src,alt:"",style:{maxWidth:"92vw",maxHeight:"88vh",objectFit:"contain",borderRadius:10,boxShadow:"0 20px 60px rgba(0,0,0,0.5)",display:"block",animation:"zoomIn 0.18s ease"}}),
+      React.createElement("button",{onClick:onClose,style:{position:"absolute",top:-14,right:-14,width:28,height:28,borderRadius:"50%",background:"#fff",color:"#111",border:"none",fontSize:16,cursor:"pointer",fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:"0 2px 8px rgba(0,0,0,0.3)"}},"×")
+    )
+  );
+}
+
+function Sparkline({history,currentValue}){
+  if(!history?.length&&!currentValue)return React.createElement("div",{style:{fontSize:11,color:"#9ca3af",textAlign:"center",padding:"20px 0"}},"No history data yet");
+  const periods=["365d","90d","30d"];
+  const points=[];
+  periods.forEach(p=>{const h=history?.find(x=>x.period===p);if(h?.avgPrice)points.push({label:p==="365d"?"1y":p==="90d"?"90d":"30d",value:h.avgPrice,count:h.salesCount})});
+  if(currentValue)points.push({label:"Now",value:currentValue});
+  if(points.length<2)return React.createElement("div",{style:{fontSize:11,color:"#9ca3af",textAlign:"center",padding:"20px 0"}},"Need more data for chart");
+  const W=300,H=80,PAD=10;
+  const vals=points.map(p=>p.value);
+  const minV=Math.min(...vals)*0.95,maxV=Math.max(...vals)*1.05;
+  const xStep=(W-PAD*2)/(points.length-1);
+  const toY=v=>PAD+(1-(v-minV)/(maxV-minV))*(H-PAD*2);
+  const toX=i=>PAD+i*xStep;
+  const pathD=points.map((p,i)=>`${i===0?"M":"L"}${toX(i).toFixed(1)},${toY(p.value).toFixed(1)}`).join(" ");
+  const areaD=pathD+` L${toX(points.length-1).toFixed(1)},${H} L${PAD},${H} Z`;
+  const trend=points[points.length-1].value-points[0].value;
+  const lineColor=trend>=0?"#16a34a":"#dc2626";
+  return React.createElement("div",{style:{width:"100%"}},
+    React.createElement("svg",{viewBox:`0 0 ${W} ${H}`,style:{width:"100%",height:H,overflow:"visible"}},
+      React.createElement("defs",null,React.createElement("linearGradient",{id:"sg",x1:"0",y1:"0",x2:"0",y2:"1"},React.createElement("stop",{offset:"0%",stopColor:lineColor,stopOpacity:0.15}),React.createElement("stop",{offset:"100%",stopColor:lineColor,stopOpacity:0}))),
+      React.createElement("path",{d:areaD,fill:"url(#sg)"}),
+      React.createElement("path",{d:pathD,fill:"none",stroke:lineColor,strokeWidth:2,strokeLinejoin:"round",strokeLinecap:"round"}),
+      points.map((p,i)=>React.createElement("g",{key:i},
+        React.createElement("circle",{cx:toX(i),cy:toY(p.value),r:3,fill:i===points.length-1?"#111827":lineColor,stroke:"#fff",strokeWidth:1.5}),
+        React.createElement("text",{x:toX(i),y:H-1,textAnchor:"middle",fontSize:9,fill:"#9ca3af"},p.label)
+      ))
+    ),
+    React.createElement("div",{style:{display:"flex",justifyContent:"space-between",marginTop:6}},
+      points.map((p,i)=>React.createElement("div",{key:i,style:{textAlign:"center"}},
+        React.createElement("div",{style:{fontSize:11,fontWeight:700,color:i===points.length-1?"#111827":"#374151"}},fmt(p.value)),
+        p.count&&React.createElement("div",{style:{fontSize:9,color:"#9ca3af"}},p.count+" sales")
+      ))
+    )
+  );
+}
+
+function SidebarSportBlock({sport,cards}){
+  const sc=cards.filter(c=>c.sport===sport.key);
+  const tCost=sc.reduce((s,c)=>s+(c.costPaid||0),0);
+  const tMkt=sc.filter(c=>c.estValue).reduce((s,c)=>s+c.estValue,0);
+  const p=pct(tCost,tMkt);
+  return React.createElement("div",{style:{marginBottom:14}},
+    React.createElement("div",{style:{display:"flex",alignItems:"center",gap:6,marginBottom:6}},
+      React.createElement("span",{style:{fontSize:14}},sport.emoji),
+      React.createElement("span",{style:{fontSize:12,fontWeight:700,color:sport.accent,textTransform:"uppercase",letterSpacing:"0.05em"}},sport.label),
+      React.createElement("span",{style:{marginLeft:"auto",fontSize:11,color:"#6b7280"}},sc.length)
+    ),
+    React.createElement("div",{style:{background:"#1f2937",borderRadius:9,padding:"9px 12px",display:"flex",flexDirection:"column",gap:5}},
+      React.createElement("div",{style:{display:"flex",justifyContent:"space-between"}},React.createElement("span",{style:{fontSize:11,color:"#6b7280"}},"Market"),React.createElement("span",{style:{fontSize:13,fontWeight:700,color:"#f9fafb"}},fmtK(tMkt||null))),
+      React.createElement("div",{style:{display:"flex",justifyContent:"space-between"}},React.createElement("span",{style:{fontSize:11,color:"#6b7280"}},"Cost"),React.createElement("span",{style:{fontSize:12,color:"#9ca3af"}},tCost>0?fmtK(tCost):"—")),
+      p!==null&&React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",borderTop:"1px solid #374151",paddingTop:5}},React.createElement("span",{style:{fontSize:11,color:"#6b7280"}},"Return"),React.createElement(ReturnBadge,{cost:tCost,mkt:tMkt}))
+    )
+  );
+}
+
+function CardDrawer({card,onClose,onUpdateCost,onRetry,onDelete,onRefreshPrice}){
+  if(!card)return null;
+  const sport=SPORTS.find(s=>s.key===card.sport);
+  const[confirmDelete,setConfirmDelete]=useState(false);
+  const[tab,setTab]=useState("comps");
+  const rows=[["Sport",sport?sport.emoji+" "+sport.label:"—"],["Player",card.player],["Team",card.team],["Year",card.year],["Brand",card.brand],["Series",card.series],["Card #",card.cardNumber],["Grade",card.gradingCompany&&card.grade?card.gradingCompany+" "+card.grade:null],["Condition",card.condition],["Added",card.addedAt?card.addedAt.split("T")[0]:null]].filter(([,v])=>v);
+  return React.createElement("div",{className:"drawer",style:{position:"fixed",top:0,right:0,width:370,height:"100vh",background:"#fff",boxShadow:"-4px 0 28px rgba(0,0,0,0.14)",zIndex:200,display:"flex",flexDirection:"column",overflowY:"auto"}},
+    React.createElement("div",{style:{padding:"13px 16px",borderBottom:"1px solid #f1f5f9",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0}},
+      React.createElement("div",null,React.createElement("div",{style:{fontWeight:700,fontSize:15,color:"#111827"}},card.player||"Card Detail"),card.isDuplicate&&React.createElement("div",{style:{fontSize:11,color:"#f59e0b",fontWeight:600}},"⚠ Possible duplicate")),
+      React.createElement("div",{style:{display:"flex",gap:6,alignItems:"center"}},
+        React.createElement("button",{onClick:()=>onRefreshPrice(card.id),style:{background:"none",border:"none",fontSize:13,color:"#6366f1",cursor:"pointer",padding:"3px 6px",fontWeight:600}},"↻"),
+        React.createElement("button",{onClick:()=>setConfirmDelete(true),style:{background:"none",border:"none",fontSize:13,color:"#dc2626",cursor:"pointer"}},"🗑"),
+        React.createElement("button",{onClick:onClose,style:{background:"none",border:"none",fontSize:22,color:"#9ca3af",cursor:"pointer"}},"×")
+      )
+    ),
+    confirmDelete&&React.createElement("div",{style:{padding:"10px 16px",background:"#fef2f2",borderBottom:"1px solid #fca5a5",display:"flex",alignItems:"center",gap:10}},
+      React.createElement("span",{style:{fontSize:13,color:"#dc2626",flex:1}},"Remove this card?"),
+      React.createElement("button",{onClick:()=>{onDelete(card.id);onClose()},style:{fontSize:12,padding:"4px 10px",background:"#dc2626",color:"#fff",border:"none",borderRadius:6,cursor:"pointer",fontWeight:600}},"Remove"),
+      React.createElement("button",{onClick:()=>setConfirmDelete(false),style:{fontSize:12,padding:"4px 10px",background:"#f3f4f6",color:"#374151",border:"none",borderRadius:6,cursor:"pointer"}},"Cancel")
+    ),
+    React.createElement("img",{src:card.dataUrl,alt:"",style:{width:"100%",maxHeight:210,objectFit:"contain",background:"#f8fafc",padding:"10px 0",flexShrink:0}}),
+    React.createElement("div",{style:{padding:"14px 16px",flex:1}},
+      React.createElement("div",{style:{marginBottom:12}},rows.map(([k,v])=>React.createElement("div",{key:k,style:{display:"flex",justifyContent:"space-between",padding:"4px 0",borderBottom:"1px solid #f8fafc"}},React.createElement("span",{style:{fontSize:12,color:"#6b7280"}},k),React.createElement("span",{style:{fontSize:12,fontWeight:600,color:"#111827"}},v)))),
+      React.createElement("div",{style:{display:"flex",gap:4,flexWrap:"wrap",marginBottom:12}},
+        card.graded&&React.createElement("span",{style:{fontSize:11,padding:"2px 7px",background:"#fef3c7",color:"#92400e",borderRadius:6,fontWeight:600}},"GRADED"),
+        card.psaVerified&&React.createElement("span",{style:{fontSize:11,padding:"2px 7px",background:"#dcfce7",color:"#15803d",borderRadius:6,fontWeight:600}},"✓ PSA"),
+        card.rookieCard&&React.createElement("span",{style:{fontSize:11,padding:"2px 7px",background:"#dbeafe",color:"#1e40af",borderRadius:6,fontWeight:600}},"RC"),
+        card.autograph&&React.createElement("span",{style:{fontSize:11,padding:"2px 7px",background:"#f5f3ff",color:"#5b21b6",borderRadius:6,fontWeight:600}},"AUTO"),
+        card.numbered&&React.createElement("span",{style:{fontSize:11,padding:"2px 7px",background:"#fce7f3",color:"#831843",borderRadius:6,fontWeight:600}},card.numbered)
+      ),
+      React.createElement("div",{style:{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:10,padding:"11px 13px",marginBottom:12}},
+        React.createElement("div",{style:{fontSize:11,color:"#64748b",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}},"Valuation"),
+        React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}},React.createElement("span",{style:{fontSize:12,color:"#6b7280"}},"Market value"),React.createElement("div",{style:{display:"flex",alignItems:"center",gap:6}},card.compsStatus==="fetching"&&React.createElement("span",{className:"spinner"}),React.createElement("span",{style:{fontSize:17,fontWeight:800,color:"#111827"}},fmt(card.estValue)))),
+        React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:card.costPaid!=null?8:0}},React.createElement("span",{style:{fontSize:12,color:"#6b7280"}},"Your cost"),React.createElement(InlineEdit,{value:card.costPaid,onChange:v=>onUpdateCost(card.id,v)})),
+        card.costPaid!=null&&React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",borderTop:"1px solid #e2e8f0",paddingTop:8}},React.createElement("span",{style:{fontSize:12,color:"#6b7280"}},"Return"),React.createElement(ReturnBadge,{cost:card.costPaid,mkt:card.estValue})),
+        card.priceRefreshedAt&&React.createElement("div",{style:{fontSize:10,color:"#9ca3af",marginTop:6}},"Updated: "+card.priceRefreshedAt.split("T")[0])
+      ),
+      React.createElement("div",{style:{display:"flex",gap:0,marginBottom:10,borderBottom:"2px solid #f1f5f9"}},
+        ["comps","history"].map(t=>React.createElement("button",{key:t,onClick:()=>setTab(t),style:{flex:1,padding:"7px 0",fontSize:12,fontWeight:tab===t?700:400,color:tab===t?"#111827":"#9ca3af",background:"none",border:"none",cursor:"pointer",borderBottom:tab===t?"2px solid #111827":"2px solid transparent",marginBottom:-2}},t==="comps"?"Recent Sales":"Price History"))
+      ),
+      tab==="comps"&&React.createElement("div",null,
+        card.compsSummary&&React.createElement("div",{style:{fontSize:12,color:"#475569",background:"#f8fafc",padding:"7px 10px",borderRadius:7,marginBottom:8,lineHeight:1.5}},card.compsSummary),
+        card.comps?.length>0
+          ?React.createElement("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:12}},
+              React.createElement("thead",null,React.createElement("tr",{style:{background:"#f1f5f9"}},["Sale","Src","Date","Price"].map(h=>React.createElement("th",{key:h,style:{padding:"6px 8px",textAlign:h==="Price"?"right":"left",color:"#64748b",fontWeight:600,fontSize:11}},h)))),
+              React.createElement("tbody",null,card.comps.map((c,i)=>React.createElement("tr",{key:i,style:{borderBottom:"1px solid #f1f5f9"}},
+                React.createElement("td",{style:{padding:"6px 8px",color:"#374151",maxWidth:100,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},c.url?React.createElement("a",{href:c.url,target:"_blank",rel:"noopener noreferrer",style:{color:"#2563eb",textDecoration:"none"}},c.label):(c.label||"Comp "+(i+1))),
+                React.createElement("td",{style:{padding:"6px 8px"}},React.createElement("span",{style:{fontSize:10,padding:"1px 5px",borderRadius:8,fontWeight:700,background:c.source==="eBay"?"#fef3c7":c.source==="Fanatics"?"#dbeafe":"#f3f4f6",color:c.source==="eBay"?"#92400e":c.source==="Fanatics"?"#1e40af":"#374151"}},c.source)),
+                React.createElement("td",{style:{padding:"6px 8px",color:"#9ca3af",fontSize:11}},c.date||"—"),
+                React.createElement("td",{style:{padding:"6px 8px",textAlign:"right",fontWeight:700,color:"#111827"}},fmt(c.price))
+              )))
+            )
+          :card.compsStatus==="fetching"?React.createElement("div",{style:{textAlign:"center",padding:"14px",color:"#9ca3af",fontSize:12}},"Searching eBay & Fanatics…")
+          :React.createElement("div",{style:{textAlign:"center",padding:"12px",color:"#9ca3af",fontSize:12}},"No comps found")
+      ),
+      tab==="history"&&React.createElement("div",null,React.createElement(Sparkline,{history:card.priceHistory||[],currentValue:card.estValue})),
+      card.notes&&React.createElement("div",{style:{fontSize:12,color:"#7c3aed",background:"#f5f3ff",padding:"8px 10px",borderRadius:7,marginTop:10}},"✦ "+card.notes),
+      card.status==="error"&&React.createElement("button",{onClick:()=>onRetry(card.id),style:{width:"100%",fontSize:13,padding:"8px 0",background:"#fef2f2",color:"#dc2626",border:"1px solid #fca5a5",borderRadius:8,cursor:"pointer",fontWeight:600,marginTop:10}},"↺ Retry")
+    )
+  );
+}
+
+function TableRow({card,onSelect,onUpdateCost,isSelected,onZoom}){
+  const sport=SPORTS.find(s=>s.key===card.sport);
+  const statusColor={done:"#16a34a",error:"#dc2626",analyzing:"#f59e0b",pending:"#d1d5db"}[card.status];
+  return React.createElement("tr",{onClick:()=>onSelect(card),style:{cursor:"pointer",background:isSelected?"#eff6ff":card.isDuplicate?"#fffbeb":"transparent",borderBottom:"1px solid #f1f5f9",transition:"background 0.1s"},onMouseEnter:e=>{if(!isSelected)e.currentTarget.style.background=card.isDuplicate?"#fef3c7":"#f8fafc"},onMouseLeave:e=>{if(!isSelected)e.currentTarget.style.background=card.isDuplicate?"#fffbeb":"transparent"}},
+    React.createElement("td",{style:{padding:"9px 12px",minWidth:190}},
+      React.createElement("div",{style:{display:"flex",alignItems:"center",gap:10}},
+        React.createElement("div",{style:{position:"relative",flexShrink:0}},
+          React.createElement("img",{src:card.dataUrl,alt:"",onClick:e=>{e.stopPropagation();onZoom(card.dataUrl)},style:{width:34,height:46,objectFit:"cover",borderRadius:5,border:"1px solid #e5e7eb",cursor:"zoom-in",transition:"transform 0.15s"},onMouseEnter:e=>e.currentTarget.style.transform="scale(1.15)",onMouseLeave:e=>e.currentTarget.style.transform="scale(1)"}),
+          card.isDuplicate&&React.createElement("div",{style:{position:"absolute",top:-4,right:-4,width:14,height:14,borderRadius:"50%",background:"#f59e0b",color:"#fff",fontSize:8,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700}},"!")
+        ),
+        React.createElement("div",{style:{minWidth:0}},
+          React.createElement("div",{style:{fontWeight:600,fontSize:13,color:"#111827",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",maxWidth:155}},card.player||(card.status==="analyzing"?"Analyzing…":card.status==="error"?"⚠ Failed":"Unknown")),
+          React.createElement("div",{style:{fontSize:11,color:"#9ca3af",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",maxWidth:155}},[card.year,card.brand].filter(Boolean).join(" · ")||"")
+        )
+      )
+    ),
+    React.createElement("td",{style:{padding:"9px 12px",whiteSpace:"nowrap"}},React.createElement(SportChip,{sport:card.sport})),
+    React.createElement("td",{style:{padding:"9px 12px",fontSize:12,color:"#374151",whiteSpace:"nowrap"}},card.team||"—"),
+    React.createElement("td",{style:{padding:"9px 12px",whiteSpace:"nowrap"}},card.graded&&card.gradingCompany?React.createElement("span",{style:{fontSize:11,fontWeight:700,padding:"2px 7px",background:"#fef3c7",color:"#92400e",borderRadius:6}},card.gradingCompany+" "+card.grade):React.createElement("span",{style:{fontSize:12,color:"#9ca3af"}},card.condition||"—")),
+    React.createElement("td",{style:{padding:"9px 12px",textAlign:"right",fontWeight:700,fontSize:14,color:"#111827",whiteSpace:"nowrap"}},card.compsStatus==="fetching"?React.createElement("span",{className:"spinner"}):fmt(card.estValue)),
+    React.createElement("td",{style:{padding:"9px 12px",textAlign:"right",whiteSpace:"nowrap"},onClick:e=>e.stopPropagation()},React.createElement(InlineEdit,{value:card.costPaid,onChange:v=>onUpdateCost(card.id,v)})),
+    React.createElement("td",{style:{padding:"9px 12px",textAlign:"right",whiteSpace:"nowrap"}},React.createElement(ReturnBadge,{cost:card.costPaid,mkt:card.estValue})),
+    React.createElement("td",{style:{padding:"9px 12px",whiteSpace:"nowrap"}},card.compsStatus==="fetching"?React.createElement("span",{style:{fontSize:11,color:"#f59e0b"}},"fetching…"):card.comps?.length>0?React.createElement("span",{style:{fontSize:11,color:"#6366f1",fontWeight:600}},card.comps.length+" comps"):React.createElement("span",{style:{fontSize:11,color:"#d1d5db"}},"—")),
+    React.createElement("td",{style:{padding:"9px 12px"}},React.createElement("span",{style:{display:"inline-flex",alignItems:"center",gap:4,fontSize:11}},React.createElement("span",{style:{width:7,height:7,borderRadius:"50%",background:statusColor||"#d1d5db",display:"inline-block"}}),React.createElement("span",{style:{color:statusColor}},{done:"OK",error:"Err",analyzing:"…",pending:"—"}[card.status]||"—"))),
+    React.createElement("td",{style:{padding:"9px 12px"}},React.createElement("div",{style:{display:"flex",gap:3}},card.rookieCard&&React.createElement("span",{style:{fontSize:9,padding:"1px 5px",background:"#dbeafe",color:"#1e40af",borderRadius:4,fontWeight:700}},"RC"),card.autograph&&React.createElement("span",{style:{fontSize:9,padding:"1px 5px",background:"#f5f3ff",color:"#5b21b6",borderRadius:4,fontWeight:700}},"AUTO"),card.isDuplicate&&React.createElement("span",{style:{fontSize:9,padding:"1px 5px",background:"#fef3c7",color:"#92400e",borderRadius:4,fontWeight:700}},"DUPE?")))
+  );
+}
+
+function BulkRefreshModal({cards,onClose,onDone}){
+  const[log,setLog]=useState([]);
+  const[running,setRunning]=useState(false);
+  const[done,setDone]=useState(false);
+  const updatesRef=useRef({});
+  const run=async()=>{
+    setRunning(true);
+    const eligible=cards.filter(c=>c.player&&c.status==="done");
+    for(let i=0;i<eligible.length;i++){
+      const card=eligible[i];
+      setLog(l=>[...l,{id:card.id,msg:`(${i+1}/${eligible.length}) ${card.player} — fetching…`,status:"running"}]);
+      try{
+        const live=await fetchComps(card);
+        const mkt=live.marketValue||null;
+        updatesRef.current[card.id]={comps:live.comps||[],estValue:mkt,compsSources:live.sources||[],compsSummary:live.summary||"",priceHistory:live.history||[],compsStatus:"done",priceRefreshedAt:new Date().toISOString()};
+        setLog(l=>l.map(x=>x.id===card.id?{...x,msg:`${card.player} — ${mkt?fmt(mkt):"no price"}`,status:"done"}:x));
+      }catch{setLog(l=>l.map(x=>x.id===card.id?{...x,msg:`${card.player} — failed`,status:"error"}:x))}
+      await sleep(200);
+    }
+    setRunning(false);setDone(true);
+  };
+  return React.createElement("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:300,display:"flex",alignItems:"center",justifyContent:"center"}},
+    React.createElement("div",{style:{background:"#fff",borderRadius:14,width:460,maxHeight:"80vh",display:"flex",flexDirection:"column",overflow:"hidden",boxShadow:"0 20px 60px rgba(0,0,0,0.2)"}},
+      React.createElement("div",{style:{padding:"16px 20px",borderBottom:"1px solid #f1f5f9",display:"flex",alignItems:"center",justifyContent:"space-between"}},
+        React.createElement("div",null,React.createElement("div",{style:{fontWeight:700,fontSize:15,color:"#111827"}},"Bulk Price Refresh"),React.createElement("div",{style:{fontSize:12,color:"#6b7280",marginTop:1}},cards.filter(c=>c.player&&c.status==="done").length+" cards will be refreshed")),
+        !running&&React.createElement("button",{onClick:onClose,style:{background:"none",border:"none",fontSize:20,color:"#9ca3af",cursor:"pointer"}},"×")
+      ),
+      React.createElement("div",{style:{flex:1,overflowY:"auto",padding:"14px 20px"}},
+        !running&&!done&&React.createElement("div",{style:{textAlign:"center",padding:"30px 0"}},React.createElement("div",{style:{fontSize:32,marginBottom:10}},"↻"),React.createElement("div",{style:{fontSize:14,color:"#374151"}},"Ready to refresh all prices")),
+        log.map((l,i)=>React.createElement("div",{key:i,style:{display:"flex",alignItems:"center",gap:8,padding:"5px 0",borderBottom:"1px solid #f8fafc"}},
+          l.status==="running"?React.createElement("span",{className:"spinner"}):React.createElement("span",{style:{fontSize:11,color:l.status==="done"?"#16a34a":"#dc2626"}},l.status==="done"?"✓":"✗"),
+          React.createElement("span",{style:{fontSize:12,color:l.status==="error"?"#dc2626":"#374151"}},l.msg)
+        ))
+      ),
+      React.createElement("div",{style:{padding:"12px 20px",borderTop:"1px solid #f1f5f9",display:"flex",gap:8,justifyContent:"flex-end"}},
+        !running&&!done&&React.createElement("button",{onClick:run,style:{padding:"8px 20px",background:"#111827",color:"#fff",border:"none",borderRadius:8,fontSize:13,fontWeight:700,cursor:"pointer"}},"Start"),
+        done&&React.createElement("button",{onClick:()=>{onDone(updatesRef.current);onClose()},style:{padding:"8px 20px",background:"#16a34a",color:"#fff",border:"none",borderRadius:8,fontSize:13,fontWeight:700,cursor:"pointer"}},"Apply & Close"),
+        !running&&React.createElement("button",{onClick:onClose,style:{padding:"8px 16px",background:"#f3f4f6",color:"#374151",border:"none",borderRadius:8,fontSize:13,cursor:"pointer"}},"Cancel")
+      )
+    )
+  );
+}
+
+// ── MAIN APP ──────────────────────────────────────────────────────────────────
+function App(){
+  const[cards,setCards]=useState(()=>loadCards());
+  const[filter,setFilter]=useState("all");
+  const[search,setSearch]=useState("");
+  const[analyzing,setAnalyzing]=useState(false);
+  const[progress,setProgress]=useState({current:0,total:0,label:""});
+  const[dragging,setDragging]=useState(false);
+  const[staged,setStaged]=useState([]);
+  const[uploadError,setUploadError]=useState(null);
+  const[selectedCard,setSelectedCard]=useState(null);
+  const[zoomedImg,setZoomedImg]=useState(null);
+  const[storageInfo,setStorageInfo]=useState("");
+  const[showBulkRefresh,setShowBulkRefresh]=useState(false);
+  const fileInputRef=useRef();
+
+  useEffect(()=>{
+    if(!cards.length&&!loadCards().length)return;
+    saveCards(cards);
+    try{const b=new Blob([JSON.stringify(cards)]).size;setStorageInfo(`${cards.length} cards · ${(b/1024/1024).toFixed(1)}MB`);}catch{}
+  },[cards]);
+
+  const addFiles=useCallback(async(files)=>{
+    setUploadError(null);
+    const imageFiles=Array.from(files).filter(f=>f.type.startsWith("image/")||/\.(jpg|jpeg|png|webp|gif|avif|heic|heif|bmp)$/i.test(f.name));
+    if(!imageFiles.length){setUploadError("No image files found.");return}
+    let failed=0;
+    for(const file of imageFiles){
+      try{const r=await readImageFile(file);setStaged(prev=>[...prev,{id:Date.now()+Math.random(),...r}]);}
+      catch{failed++}
+    }
+    if(failed)setUploadError(failed+" file(s) could not be loaded.");
+  },[]);
+
+  const handleDrop=useCallback(e=>{e.preventDefault();setDragging(false);addFiles(e.dataTransfer.files)},[addFiles]);
+
+  const runAnalysis=async()=>{
+    if(!staged.length||analyzing)return;
+    const images=[...staged];setStaged([]);setAnalyzing(true);
+    setProgress({current:0,total:images.length,label:"Starting…"});
+
+    // Create stubs
+    const stubs=images.map((img,i)=>({
+      id:Date.now()+i+Math.random(),dataUrl:img.dataUrl,base64:img.base64,mediaType:img.mediaType,
+      sport:"unknown",player:null,team:null,year:null,brand:null,series:null,cardNumber:null,
+      condition:null,graded:false,gradingCompany:null,grade:null,estValue:null,costPaid:null,
+      rookieCard:false,autograph:false,numbered:null,notes:null,
+      comps:[],compsStatus:null,compsSources:[],compsSummary:"",priceHistory:[],
+      isDuplicate:false,status:"analyzing",addedAt:new Date().toISOString(),
+    }));
+    setCards(prev=>[...prev,...stubs]);
+
+    // BATCH ANALYSIS — send 5 cards at a time to identify
+    const BATCH_SIZE=5;
+    const identified=new Array(images.length).fill(null);
+
+    for(let b=0;b<images.length;b+=BATCH_SIZE){
+      const batchImages=images.slice(b,b+BATCH_SIZE);
+      const batchStubs=stubs.slice(b,b+BATCH_SIZE);
+      setProgress({current:b,total:images.length,label:`Identifying cards ${b+1}–${Math.min(b+BATCH_SIZE,images.length)} of ${images.length}…`});
+
+      try{
+        const result=await analyzeBatch(batchImages);
+        const results=result.results||[];
+
+        results.forEach(info=>{
+          const idx=b+(info.cardIndex||0);
+          if(idx>=stubs.length)return;
+          identified[idx]=info;
+          const stub=stubs[idx];
+          const partial={...stub,...info,sport:info.sport||"unknown",
+            graded:!!info.graded,rookieCard:!!info.rookieCard,autograph:!!info.autograph,
+            comps:[],compsStatus:"fetching",status:"done"};
+          setCards(prev=>prev.map(c=>c.id===stub.id?partial:c));
+        });
+
+        // Mark any in batch that didn't get results as error
+        batchStubs.forEach((stub,bi)=>{
+          if(!identified[b+bi]){
+            setCards(prev=>prev.map(c=>c.id===stub.id?{...c,status:"error"}:c));
+          }
+        });
+      }catch(e){
+        console.error("Batch identify failed:",e);
+        batchStubs.forEach(stub=>setCards(prev=>prev.map(c=>c.id===stub.id?{...c,status:"error"}:c)));
+      }
+      if(b+BATCH_SIZE<images.length)await sleep(500);
+    }
+
+    // NOW fetch comps for each identified card (in parallel, 3 at a time)
+    const identifiedCards=stubs.filter((_,i)=>identified[i]!==null);
+    setProgress({current:0,total:identifiedCards.length,label:"Fetching live prices…"});
+
+    const COMP_PARALLEL=3;
+    for(let i=0;i<identifiedCards.length;i+=COMP_PARALLEL){
+      const batch=identifiedCards.slice(i,i+COMP_PARALLEL);
+      setProgress({current:i,total:identifiedCards.length,label:`Fetching prices ${i+1}–${Math.min(i+COMP_PARALLEL,identifiedCards.length)} of ${identifiedCards.length}…`});
+
+      await Promise.all(batch.map(async(stub)=>{
+        const info=identified[stubs.indexOf(stub)];
+        if(!info?.player)return;
+        try{
+          const live=await fetchComps(info);
+          const mkt=live.marketValue||null;
+          const updated={...stub,...info,sport:info.sport||"unknown",graded:!!info.graded,rookieCard:!!info.rookieCard,autograph:!!info.autograph,
+            comps:live.comps||[],estValue:mkt,compsSources:live.sources||[],compsSummary:live.summary||"",
+            priceHistory:live.history||[],compsStatus:"done",status:"done",priceRefreshedAt:new Date().toISOString()};
+          setCards(prev=>prev.map(c=>c.id===stub.id?updated:c));
+        }catch(e){
+          console.warn("Comps failed:",e.message);
+          setCards(prev=>prev.map(c=>c.id===stub.id?{...c,compsStatus:"error"}:c));
+        }
+      }));
+      await sleep(300);
+    }
+
+    setAnalyzing(false);
+  };
+
+  const retryCard=async(cardId)=>{
+    const card=cards.find(c=>c.id===cardId);if(!card)return;
+    setCards(prev=>prev.map(c=>c.id===cardId?{...c,status:"analyzing",compsStatus:null}:c));
+    try{
+      const result=await analyzeBatch([{base64:card.base64,mediaType:card.mediaType}]);
+      const info=result.results?.[0];
+      if(!info)throw new Error("No result");
+      const partial={...card,...info,sport:info.sport||"unknown",graded:!!info.graded,rookieCard:!!info.rookieCard,autograph:!!info.autograph,comps:[],compsStatus:"fetching",status:"done"};
+      setCards(prev=>prev.map(c=>c.id===cardId?partial:c));
+      setSelectedCard(prev=>prev?.id===cardId?partial:prev);
+      const live=await fetchComps(info);
+      const mkt=live.marketValue||null;
+      const updated={...partial,comps:live.comps||[],estValue:mkt,compsSources:live.sources||[],compsSummary:live.summary||"",priceHistory:live.history||[],compsStatus:"done",priceRefreshedAt:new Date().toISOString()};
+      setCards(prev=>prev.map(c=>c.id===cardId?updated:c));
+      setSelectedCard(prev=>prev?.id===cardId?updated:prev);
+    }catch{setCards(prev=>prev.map(c=>c.id===cardId?{...c,status:"error"}:c))}
+  };
+
+  const refreshCardPrice=async(cardId)=>{
+    const card=cards.find(c=>c.id===cardId);if(!card?.player)return;
+    setCards(prev=>prev.map(c=>c.id===cardId?{...c,compsStatus:"fetching"}:c));
+    setSelectedCard(prev=>prev?.id===cardId?{...prev,compsStatus:"fetching"}:prev);
+    try{
+      const live=await fetchComps(card);
+      const mkt=live.marketValue||null;
+      const updated={...card,comps:live.comps||[],estValue:mkt,compsSources:live.sources||[],compsSummary:live.summary||"",priceHistory:live.history||[],compsStatus:"done",priceRefreshedAt:new Date().toISOString()};
+      setCards(prev=>prev.map(c=>c.id===cardId?updated:c));
+      setSelectedCard(prev=>prev?.id===cardId?updated:prev);
+    }catch{setCards(prev=>prev.map(c=>c.id===cardId?{...c,compsStatus:"error"}:c))}
+  };
+
+  const applyBulkUpdates=updates=>{
+    setCards(prev=>prev.map(c=>updates[c.id]?{...c,...updates[c.id]}:c));
+    setSelectedCard(prev=>prev&&updates[prev.id]?{...prev,...updates[prev.id]}:prev);
+  };
+
+  const updateCost=(id,cost)=>{setCards(prev=>prev.map(c=>c.id===id?{...c,costPaid:cost}:c));setSelectedCard(prev=>prev?.id===id?{...prev,costPaid:cost}:prev)};
+  const deleteCard=id=>{setCards(prev=>prev.filter(c=>c.id!==id));setSelectedCard(null)};
+
+  const exportCSV=()=>{
+    const hdr=["Player","Team","Sport","Year","Brand","Series","Card#","Grade","Condition","Market Value","Cost Paid","Return %","Return $","RC","Auto","Numbered","Notes","Added"];
+    const rows=cards.map(c=>{const p=pct(c.costPaid,c.estValue),d=absDiff(c.costPaid,c.estValue);return[c.player,c.team,c.sport,c.year,c.brand,c.series,c.cardNumber,c.gradingCompany&&c.grade?`${c.gradingCompany} ${c.grade}`:"",c.condition,c.estValue||"",c.costPaid||"",p!=null?p.toFixed(1)+"%":"",d!=null?d.toFixed(2):"",c.rookieCard?"Yes":"",c.autograph?"Yes":"",c.numbered||"",c.notes||"",c.addedAt?c.addedAt.split("T")[0]:""].map(v=>`"${String(v||"").replace(/"/g,'""')}"`)});
+    const csv=[hdr,...rows].map(r=>r.join(",")).join("\n");
+    const blob=new Blob([csv],{type:"text/csv"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="CardVault_export.csv";a.click();URL.revokeObjectURL(url);
+  };
+
+  const filtered=cards.filter(c=>{
+    if(filter!=="all"&&c.sport!==filter)return false;
+    if(search){const hay=[c.player,c.team,c.year,c.brand,c.series,c.gradingCompany].filter(Boolean).join(" ").toLowerCase();if(!hay.includes(search.toLowerCase()))return false}
+    return true;
+  });
+
+  const tMkt=cards.filter(c=>c.estValue).reduce((s,c)=>s+c.estValue,0);
+  const tCost=cards.reduce((s,c)=>s+(c.costPaid||0),0);
+  const dupeCount=cards.filter(c=>c.isDuplicate).length;
+
+  return React.createElement("div",{style:{display:"flex",height:"100vh",overflow:"hidden",background:"#f4f5f7"}},
+    // SIDEBAR
+    React.createElement("div",{style:{width:228,minWidth:228,background:"#111827",color:"#fff",display:"flex",flexDirection:"column",padding:"18px 14px",overflowY:"auto"}},
+      React.createElement("div",{style:{marginBottom:18}},React.createElement("div",{style:{fontSize:17,fontWeight:800,letterSpacing:"-0.02em"}},"CardVault"),React.createElement("div",{style:{fontSize:11,color:"#6b7280",marginTop:1}},"Collection Manager")),
+      React.createElement("div",{style:{background:"#1f2937",borderRadius:11,padding:"12px",marginBottom:18}},
+        React.createElement("div",{style:{fontSize:11,color:"#6b7280",fontWeight:600,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:5}},"Portfolio"),
+        React.createElement("div",{style:{fontSize:22,fontWeight:800,color:"#fff",marginBottom:1}},fmtK(tMkt||null)),
+        React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center"}},React.createElement("span",{style:{fontSize:12,color:"#6b7280"}},"Cost: "+(tCost>0?fmtK(tCost):"—")),React.createElement(ReturnBadge,{cost:tCost,mkt:tMkt})),
+        React.createElement("div",{style:{marginTop:6,fontSize:11,color:"#4b5563"}},storageInfo||(cards.length+" cards")),
+        dupeCount>0&&React.createElement("div",{style:{marginTop:4,fontSize:11,color:"#f59e0b"}},`⚠ ${dupeCount} possible duplicate${dupeCount>1?"s":""}`)
+      ),
+      React.createElement("div",{style:{fontSize:11,color:"#6b7280",fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:8}},"By Sport"),
+      SPORTS.map(s=>React.createElement(SidebarSportBlock,{key:s.key,sport:s,cards})),
+      React.createElement("div",{style:{marginTop:"auto",paddingTop:12,borderTop:"1px solid #1f2937"}},
+        React.createElement("div",{style:{fontSize:11,color:"#6b7280",fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:6}},"Filter"),
+        [{key:"all",label:"All cards",emoji:"🃏"},...SPORTS].map(s=>
+          React.createElement("button",{key:s.key,onClick:()=>setFilter(s.key),style:{display:"flex",alignItems:"center",gap:7,width:"100%",padding:"6px 8px",borderRadius:7,border:"none",background:filter===s.key?"#1f2937":"transparent",color:filter===s.key?"#fff":"#9ca3af",cursor:"pointer",fontSize:13,fontWeight:filter===s.key?600:400,marginBottom:1,textAlign:"left"}},
+            React.createElement("span",null,s.emoji),React.createElement("span",null,s.label),
+            React.createElement("span",{style:{marginLeft:"auto",fontSize:11,color:"#6b7280"}},s.key==="all"?cards.length:cards.filter(c=>c.sport===s.key).length)
+          )
+        )
+      )
+    ),
+    // MAIN
+    React.createElement("div",{style:{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minWidth:0}},
+      React.createElement("div",{style:{background:"#fff",borderBottom:"1px solid #e5e7eb",padding:"10px 16px",display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",flexShrink:0}},
+        React.createElement("input",{type:"text",placeholder:"Search player, team, year, brand…",value:search,onChange:e=>setSearch(e.target.value),style:{flex:1,minWidth:160,padding:"7px 14px",fontSize:13,border:"1px solid #e5e7eb",borderRadius:20,outline:"none",color:"#111827",background:"#f9fafb"}}),
+        React.createElement("button",{onClick:()=>{setUploadError(null);fileInputRef.current.click()},style:{padding:"7px 13px",fontSize:13,fontWeight:600,background:"#f3f4f6",color:"#374151",border:"1px solid #e5e7eb",borderRadius:20,cursor:"pointer",whiteSpace:"nowrap"}},"📸 Upload"),
+        React.createElement("input",{ref:fileInputRef,type:"file",multiple:true,style:{display:"none"},onChange:e=>{addFiles(e.target.files);e.target.value=""}}),
+        React.createElement("button",{onClick:runAnalysis,disabled:!staged.length||analyzing,style:{padding:"7px 14px",fontSize:13,fontWeight:700,background:staged.length&&!analyzing?"#111827":"#e5e7eb",color:staged.length&&!analyzing?"#fff":"#9ca3af",border:"none",borderRadius:20,cursor:staged.length&&!analyzing?"pointer":"default",whiteSpace:"nowrap"}},analyzing?progress.label:staged.length?`Analyze ${staged.length}`:"Analyze"),
+        cards.filter(c=>c.status==="done"&&c.player).length>0&&React.createElement("button",{onClick:()=>setShowBulkRefresh(true),disabled:analyzing,style:{padding:"7px 13px",fontSize:13,fontWeight:600,background:"#eff6ff",color:"#2563eb",border:"1px solid #bfdbfe",borderRadius:20,cursor:"pointer",whiteSpace:"nowrap"}},"↻ Refresh All"),
+        cards.filter(c=>c.status==="error").length>0&&React.createElement("button",{onClick:()=>cards.filter(c=>c.status==="error").forEach(c=>retryCard(c.id)),disabled:analyzing,style:{padding:"7px 13px",fontSize:13,fontWeight:600,background:"#fef2f2",color:"#dc2626",border:"1px solid #fca5a5",borderRadius:20,cursor:"pointer",whiteSpace:"nowrap"}},`↺ Retry (${cards.filter(c=>c.status==="error").length})`),
+        cards.length>0&&React.createElement("button",{onClick:exportCSV,style:{padding:"7px 13px",fontSize:13,fontWeight:600,background:"#f0fdf4",color:"#16a34a",border:"1px solid #bbf7d0",borderRadius:20,cursor:"pointer",whiteSpace:"nowrap"}},"⬇ CSV")
+      ),
+      analyzing&&React.createElement("div",{style:{background:"#fff",borderBottom:"1px solid #e5e7eb",padding:"6px 16px",flexShrink:0}},
+        React.createElement("div",{style:{display:"flex",justifyContent:"space-between",marginBottom:4}},React.createElement("span",{style:{fontSize:11,color:"#6b7280"}},progress.label),React.createElement("span",{style:{fontSize:11,color:"#9ca3af"}},progress.current+"/"+progress.total)),
+        React.createElement("div",{style:{background:"#f3f4f6",borderRadius:4,height:4}},React.createElement("div",{style:{width:`${Math.round((progress.current/progress.total||0)*100)}%`,background:"#111827",height:"100%",borderRadius:4,transition:"width 0.4s"}}))
+      ),
+      (staged.length>0||uploadError)&&React.createElement("div",{style:{background:"#fff",borderBottom:"1px solid #e5e7eb",padding:"7px 16px",display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",flexShrink:0}},
+        uploadError&&React.createElement("span",{style:{fontSize:12,color:"#dc2626"}},"⚠ "+uploadError),
+        staged.length>0&&React.createElement(React.Fragment,null,
+          React.createElement("span",{style:{fontSize:12,color:"#6b7280",fontWeight:600}},staged.length+" staged:"),
+          staged.map(img=>React.createElement("div",{key:img.id,style:{position:"relative"}},
+            React.createElement("img",{src:img.dataUrl,alt:"",style:{width:32,height:44,objectFit:"cover",borderRadius:5,border:"2px solid #c7d2fe"}}),
+            React.createElement("button",{onClick:()=>setStaged(p=>p.filter(s=>s.id!==img.id)),style:{position:"absolute",top:-4,right:-4,width:14,height:14,borderRadius:"50%",background:"#ef4444",color:"#fff",border:"none",fontSize:8,cursor:"pointer",fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center"}},"×")
+          ))
+        )
+      ),
+      React.createElement("div",{style:{flex:1,overflowY:"auto",padding:"12px 16px"},onDragOver:e=>{e.preventDefault();setDragging(true)},onDragLeave:()=>setDragging(false),onDrop:handleDrop},
+        cards.length===0
+          ?React.createElement("div",{style:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"60vh",border:`2px dashed ${dragging?"#6366f1":"#d1d5db"}`,borderRadius:16,background:dragging?"#eef2ff":"transparent",transition:"all 0.15s",color:"#9ca3af"}},
+              React.createElement("div",{style:{fontSize:44,marginBottom:10}},"🃏"),
+              React.createElement("div",{style:{fontWeight:600,fontSize:15,color:"#6b7280"}},"No cards in vault yet"),
+              React.createElement("div",{style:{fontSize:13,marginTop:3}},"Upload card images to get started")
+            )
+          :React.createElement("div",{style:{background:"#fff",borderRadius:12,border:"1px solid #e5e7eb",overflow:"hidden"}},
+              React.createElement("div",{style:{overflowX:"auto"}},
+                React.createElement("table",{style:{width:"100%",borderCollapse:"collapse",fontSize:13}},
+                  React.createElement("thead",null,React.createElement("tr",{style:{background:"#f8fafc",borderBottom:"2px solid #e5e7eb"}},["Card","Sport","Team","Grade / Condition","Market Value","Your Cost","Return","Comps","Status","Tags"].map(h=>React.createElement("th",{key:h,style:{padding:"9px 12px",textAlign:["Market Value","Your Cost","Return"].includes(h)?"right":"left",fontSize:11,fontWeight:700,color:"#6b7280",textTransform:"uppercase",letterSpacing:"0.05em",whiteSpace:"nowrap"}},h)))),
+                  React.createElement("tbody",null,filtered.map(card=>React.createElement(TableRow,{key:card.id,card,onSelect:setSelectedCard,onUpdateCost:updateCost,isSelected:selectedCard?.id===card.id,onZoom:setZoomedImg}))),
+                  filtered.length>1&&React.createElement("tfoot",null,
+                    React.createElement("tr",{style:{background:"#f8fafc",borderTop:"2px solid #e5e7eb"}},
+                      React.createElement("td",{colSpan:4,style:{padding:"9px 12px",fontSize:12,fontWeight:700,color:"#374151"}},filtered.length+" cards"),
+                      React.createElement("td",{style:{padding:"9px 12px",textAlign:"right",fontSize:14,fontWeight:800,color:"#111827"}},fmt(filtered.filter(c=>c.estValue).reduce((s,c)=>s+c.estValue,0))),
+                      React.createElement("td",{style:{padding:"9px 12px",textAlign:"right",fontSize:13,fontWeight:700,color:"#374151"}},(()=>{const t=filtered.reduce((s,c)=>s+(c.costPaid||0),0);return t>0?fmt(t):"—"})()),
+                      React.createElement("td",{style:{padding:"9px 12px",textAlign:"right"}},(()=>{const fc=filtered.reduce((s,c)=>s+(c.costPaid||0),0),fm=filtered.filter(c=>c.estValue).reduce((s,c)=>s+c.estValue,0);return React.createElement(ReturnBadge,{cost:fc,mkt:fm})})()),
+                      React.createElement("td",{colSpan:3})
+                    )
+                  )
+                )
+              )
+            )
+      )
+    ),
+    selectedCard&&React.createElement(React.Fragment,null,
+      React.createElement("div",{onClick:()=>setSelectedCard(null),style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.15)",zIndex:199}}),
+      React.createElement(CardDrawer,{card:selectedCard,onClose:()=>setSelectedCard(null),onUpdateCost:updateCost,onRetry:retryCard,onDelete:deleteCard,onRefreshPrice:refreshCardPrice})
+    ),
+    showBulkRefresh&&React.createElement(BulkRefreshModal,{cards,onClose:()=>setShowBulkRefresh(false),onDone:applyBulkUpdates}),
+    React.createElement(ImageZoom,{src:zoomedImg,onClose:()=>setZoomedImg(null)})
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
+</body>
+</html>
