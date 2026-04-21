@@ -52,9 +52,12 @@ async function apiCall(endpoint, body) {
   return res.json();
 }
 
-// Analyze a batch of up to 5 cards at once
-async function analyzeBatch(images) {
-  return apiCall('analyze', { images: images.map(i => ({ base64: i.base64, mediaType: i.mediaType })) });
+// Analyze a single card
+async function analyzeOne(image, cardIndex) {
+  return apiCall('analyze', { 
+    image: { base64: image.base64, mediaType: image.mediaType },
+    cardIndex 
+  });
 }
 
 // Fetch live comps for a single card
@@ -393,41 +396,27 @@ function App(){
     }));
     setCards(prev=>[...prev,...stubs]);
 
-    // BATCH ANALYSIS — send 5 cards at a time to identify
-    const BATCH_SIZE=5;
+    // SEQUENTIAL ANALYSIS — one card at a time with delay
     const identified=new Array(images.length).fill(null);
 
-    for(let b=0;b<images.length;b+=BATCH_SIZE){
-      const batchImages=images.slice(b,b+BATCH_SIZE);
-      const batchStubs=stubs.slice(b,b+BATCH_SIZE);
-      setProgress({current:b,total:images.length,label:`Identifying cards ${b+1}–${Math.min(b+BATCH_SIZE,images.length)} of ${images.length}…`});
-
+    for(let i=0;i<images.length;i++){
+      const stub=stubs[i];
+      setProgress({current:i+1,total:images.length,label:`Identifying card ${i+1} of ${images.length}…`});
       try{
-        const result=await analyzeBatch(batchImages);
-        const results=result.results||[];
-
-        results.forEach(info=>{
-          const idx=b+(info.cardIndex||0);
-          if(idx>=stubs.length)return;
-          identified[idx]=info;
-          const stub=stubs[idx];
-          const partial={...stub,...info,sport:info.sport||"unknown",
-            graded:!!info.graded,rookieCard:!!info.rookieCard,autograph:!!info.autograph,
-            comps:[],compsStatus:"fetching",status:"done"};
-          setCards(prev=>prev.map(c=>c.id===stub.id?partial:c));
-        });
-
-        // Mark any in batch that didn't get results as error
-        batchStubs.forEach((stub,bi)=>{
-          if(!identified[b+bi]){
-            setCards(prev=>prev.map(c=>c.id===stub.id?{...c,status:"error"}:c));
-          }
-        });
+        const result=await analyzeOne(images[i], i);
+        const info=result.result;
+        if(!info)throw new Error("No result");
+        identified[i]=info;
+        const partial={...stub,...info,sport:info.sport||"unknown",
+          graded:!!info.graded,rookieCard:!!info.rookieCard,autograph:!!info.autograph,
+          comps:[],compsStatus:"fetching",status:"done"};
+        setCards(prev=>prev.map(c=>c.id===stub.id?partial:c));
       }catch(e){
-        console.error("Batch identify failed:",e);
-        batchStubs.forEach(stub=>setCards(prev=>prev.map(c=>c.id===stub.id?{...c,status:"error"}:c)));
+        console.error(`Card ${i} failed:`,e.message);
+        setCards(prev=>prev.map(c=>c.id===stub.id?{...c,status:"error"}:c));
       }
-      if(b+BATCH_SIZE<images.length)await sleep(500);
+      // Wait between cards to respect rate limits
+      if(i<images.length-1) await sleep(3000);
     }
 
     // NOW fetch comps for each identified card (in parallel, 3 at a time)
@@ -464,8 +453,8 @@ function App(){
     const card=cards.find(c=>c.id===cardId);if(!card)return;
     setCards(prev=>prev.map(c=>c.id===cardId?{...c,status:"analyzing",compsStatus:null}:c));
     try{
-      const result=await analyzeBatch([{base64:card.base64,mediaType:card.mediaType}]);
-      const info=result.results?.[0];
+      const result=await analyzeOne({base64:card.base64,mediaType:card.mediaType}, 0);
+      const info=result.result;
       if(!info)throw new Error("No result");
       const partial={...card,...info,sport:info.sport||"unknown",graded:!!info.graded,rookieCard:!!info.rookieCard,autograph:!!info.autograph,comps:[],compsStatus:"fetching",status:"done"};
       setCards(prev=>prev.map(c=>c.id===cardId?partial:c));
