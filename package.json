@@ -2,5 +2,5 @@
   "name": "cardvault",
   "version": "1.0.0",
   "description": "Sports card collection manager",
-  "engines": { "node": "18.x" }
+  "engines": { "node": "20.x" }
 }
